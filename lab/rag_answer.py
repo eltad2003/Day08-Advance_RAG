@@ -84,10 +84,40 @@ def retrieve_sparse(query: str, top_k: int = TOP_K_SEARCH) -> List[Dict[str, Any
     """
     Sparse retrieval: tìm kiếm theo keyword (BM25).
     """
-    # TODO Sprint 3: Implement BM25 search
-    # Tạm thời return empty list
-    print("[retrieve_sparse] Chưa implement — Sprint 3")
-    return []
+    from rank_bm25 import BM25Okapi
+    import chromadb
+    from index import CHROMA_DB_DIR
+
+    # 1. Load tất cả chunks từ ChromaDB
+    client = chromadb.PersistentClient(path=str(CHROMA_DB_DIR))
+    collection = client.get_collection("rag_lab")
+    all_data = collection.get(include=["documents", "metadatas"])
+    
+    if not all_data["documents"]:
+        return []
+
+    # 2. Tokenize và tạo BM25Index
+    corpus = all_data["documents"]
+    tokenized_corpus = [doc.lower().split() for doc in corpus]
+    bm25 = BM25Okapi(tokenized_corpus)
+    
+    # 3. Query
+    tokenized_query = query.lower().split()
+    scores = bm25.get_scores(tokenized_query)
+    
+    # 4. Trả về top_k kết quả
+    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
+    
+    results = []
+    for i in top_indices:
+        if scores[i] > 0: # Chỉ lấy các chunk có match keyword
+            results.append({
+                "text": corpus[i],
+                "metadata": all_data["metadatas"][i],
+                "score": float(scores[i])
+            })
+            
+    return results
 
 
 # =============================================================================
@@ -103,10 +133,36 @@ def retrieve_hybrid(
     """
     Hybrid retrieval: kết hợp dense và sparse bằng Reciprocal Rank Fusion (RRF).
     """
-    # TODO Sprint 3: Implement hybrid RRF
-    # Tạm thời fallback về dense
-    print("[retrieve_hybrid] Chưa implement RRF — fallback về dense")
-    return retrieve_dense(query, top_k)
+    dense_results = retrieve_dense(query, top_k=top_k * 2)
+    sparse_results = retrieve_sparse(query, top_k=top_k * 2)
+    
+    # RRF logic: RRF_score(doc) = weight * (1 / (60 + rank))
+    rrf_scores = {} # (text, source) -> score
+    doc_map = {}    # (text, source) -> full_doc
+    
+    # Process dense
+    for rank, doc in enumerate(dense_results):
+        key = (doc["text"], doc["metadata"]["source"])
+        rrf_scores[key] = rrf_scores.get(key, 0) + dense_weight * (1.0 / (60 + rank))
+        doc_map[key] = doc
+        
+    # Process sparse
+    for rank, doc in enumerate(sparse_results):
+        key = (doc["text"], doc["metadata"]["source"])
+        rrf_scores[key] = rrf_scores.get(key, 0) + sparse_weight * (1.0 / (60 + rank))
+        if key not in doc_map:
+            doc_map[key] = doc
+
+    # Sort and return top_k
+    sorted_keys = sorted(rrf_scores.keys(), key=lambda k: rrf_scores[k], reverse=True)
+    
+    hybrid_results = []
+    for key in sorted_keys[:top_k]:
+        doc = doc_map[key]
+        doc["score"] = rrf_scores[key] # Update to RRF score
+        hybrid_results.append(doc)
+        
+    return hybrid_results
 
 
 # =============================================================================
@@ -275,24 +331,47 @@ def rag_answer(
 
 def compare_retrieval_strategies(query: str) -> None:
     """
-    So sánh các retrieval strategies với cùng một query.
+    So sánh các retrieval strategies (Dense, Sparse, Hybrid) với cùng một query.
+    In ra bảng tóm tắt kết quả để dễ so sánh.
     """
-    print(f"\n{'='*60}")
+    print(f"\n{'='*80}")
     print(f"Query: {query}")
-    print('='*60)
+    print('='*80)
 
-    strategies = ["dense", "hybrid"]  # Thêm "sparse" sau khi implement
+    strategies = ["dense", "sparse", "hybrid"]
+    comparison_results = []
 
     for strategy in strategies:
-        print(f"\n--- Strategy: {strategy} ---")
         try:
             result = rag_answer(query, retrieval_mode=strategy, verbose=False)
-            print(f"Answer: {result['answer']}")
-            print(f"Sources: {result['sources']}")
-        except NotImplementedError as e:
-            print(f"Chưa implement: {e}")
+            comparison_results.append({
+                "strategy": strategy,
+                "answer": result["answer"],
+                "sources": result["sources"],
+                "num_chunks": len(result["chunks_used"])
+            })
         except Exception as e:
-            print(f"Lỗi: {e}")
+            comparison_results.append({
+                "strategy": strategy,
+                "answer": f"Lỗi: {e}",
+                "sources": [],
+                "num_chunks": 0
+            })
+
+    # In chi tiết từng strategy
+    for res in comparison_results:
+        print(f"\n--- Strategy: {res['strategy'].upper()} ---")
+        print(f"Answer: {res['answer']}")
+        print(f"Sources: {res['sources']}")
+
+    # In bảng tóm tắt so sánh
+    print(f"\n{'='*80}")
+    print(f"{'Strategy':<10} | {'Sources':<40} | {'Chunks':<6}")
+    print("-" * 80)
+    for res in comparison_results:
+        sources_str = ", ".join(res["sources"])[:40]
+        print(f"{res['strategy'].upper():<10} | {sources_str:<40} | {res['num_chunks']:<6}")
+    print('='*80)
 
 
 # =============================================================================
@@ -304,24 +383,28 @@ if __name__ == "__main__":
     print("Sprint 2 + 3: RAG Answer Pipeline")
     print("=" * 60)
 
-    # Test queries từ data/test_questions.json
+    # 1. Test Baseline (Sprint 2)
     test_queries = [
         "SLA xử lý ticket P1 là bao lâu?",
         "Khách hàng có thể yêu cầu hoàn tiền trong bao nhiêu ngày?",
         "Ai phải phê duyệt để cấp quyền Level 3?",
-        "ERR-403-AUTH là lỗi gì?",  # Query không có trong docs → kiểm tra abstain
+        "ERR-403-AUTH là lỗi gì?",
     ]
 
     print("\n--- Sprint 2: Test Baseline (Dense) ---")
     for query in test_queries:
         print(f"\nQuery: {query}")
         try:
-            result = rag_answer(query, retrieval_mode="dense", verbose=True)
+            result = rag_answer(query, retrieval_mode="dense", verbose=False)
             print(f"Answer: {result['answer']}")
             print(f"Sources: {result['sources']}")
-        except NotImplementedError:
-            print("Chưa implement — hoàn thành TODO trong retrieve_dense() và call_llm() trước.")
         except Exception as e:
             print(f"Lỗi: {e}")
 
-    print("\nSprint 2 setup hoàn thành!")
+    # 2. Test Tuning (Sprint 3)
+    print("\n--- Sprint 3: So sánh strategies ---")
+    compare_retrieval_strategies("Chính sách hoàn tiền phiên bản 4 (v4) áp dụng khi nào?")
+    compare_retrieval_strategies("SLA P1 2026")
+    compare_retrieval_strategies("ERR-403-AUTH")
+
+    print("\nSprint 3 setup hoàn thành!")
